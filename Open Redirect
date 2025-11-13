@@ -1,0 +1,499 @@
+"""
+Generic, Optimized Open Redirect Active Scan Rule for OWASP ZAP (Jython 2.7)
+
+Purpose (executive): deliver a resilient, generic, and production-friendly
+open-redirect detection script that can be applied broadly across targets.
+Design goals:
+ - Generic payload injection (path, query param names, and naked query)
+ - Parameter-aware tests (replace/append common redirect parameters)
+ - Proper URL-encoding of payloads
+ - Robust detection by parsing Location header and comparing hosts
+ - Per-host rate limiting and per-resource deduplication to reduce noise
+ - Defensive coding for Jython/ZAP script sandbox constraints
+ - Clear, actionable alerting payloads for analyst handoff
+
+Compatibility notes:
+ - Designed to run inside the ZAP Script Console (Jython 2.7).
+ - Avoids use of unavailable add-on metadata helpers; getMetadata() returns
+   a lightweight dict/string suitable for script-mode rules.
+"""
+
+# Standard library + Java interop imports available in the ZAP Jython sandbox
+import time
+import re
+from java.net import URI as JavaNetURI
+from java.net import URLDecoder, URLEncoder
+from org.apache.commons.httpclient import URI as HttpClientURI
+
+# ------------------------------------------------------------
+# Operational configuration (tune to your environment / policy)
+# ------------------------------------------------------------
+# Core payload templates (these are examples — extend as needed)
+# Templates should include scheme or protocol-relative forms and parameter forms.
+DEFAULT_PAYLOADS = [
+    "https://evil.example.com/",
+    "//evil.example.com/",
+    "http://evil.example.com/",
+    "https://%s/"  # %s placeholder allows host-injection variants if needed
+]
+
+# Common redirect parameter names to test when URL has query parameters.
+COMMON_REDIRECT_PARAMS = [
+    "url", "next", "redirect", "return", "returnTo", "dest", "destination", "continue", "r"
+]
+
+# Limit tests per host to avoid scan storms and operational disruption
+MAX_TESTS_PER_HOST = 20
+
+# Time delay between requests to same host (seconds) — keeps scan polite
+DELAY_BETWEEN_ATTACKS = 0.15
+
+# Whether to try path-appended payloads (adds ?payload or /payload style)
+TEST_PATH_INJECTION = True
+
+# Whether to attempt parameter replacement/injection
+TEST_PARAM_INJECTION = True
+
+# Whether to URL-encode payloads when inserting into query values
+ENCODE_PAYLOADS = True
+
+# Risk / Confidence for alerts
+RISK_HIGH = 3
+CONF_HIGH = 3
+
+# ------------------------------------------------------------
+# Runtime state (per-script, in-memory)
+# ------------------------------------------------------------
+_tests_per_host = {}       # host -> count of tests executed
+_alerts_raised = set()     # (host, uri_path, normalized_payload) -> dedupe
+
+# ------------------------------------------------------------
+# Utility helpers (defensive, Jython-friendly)
+# ------------------------------------------------------------
+def getMetadata():
+    """
+    Lightweight metadata representation for ZAP Script Console.
+    Kept simple to avoid add-on API dependencies in Jython runtime.
+    """
+    return {
+        "id": 400020,
+        "name": "Open Redirect - Generic Active Jython Rule",
+        "description": "Active tests for Open Redirect by injecting encoded redirect payloads into path and common parameters.",
+        "author": "automation",
+        "status": "alpha",
+        "risk": "High",
+        "confidence": "High"
+    }
+
+def _debug(s):
+    """Operational debug sink (prints to ZAP script console)."""
+    try:
+        print("[OpenRedirectDetector] %s" % s)
+    except:
+        pass
+
+def _normalize_host_port(uri_obj):
+    """Return canonical host:port string for dedupe and comparisons."""
+    try:
+        host = uri_obj.getHost() or ""
+        port = uri_obj.getPort()
+        if port == -1:
+            # Use scheme defaults for normalization (http:80, https:443)
+            scheme = (uri_obj.getScheme() or "").lower()
+            if scheme == "https":
+                port = 443
+            else:
+                port = 80
+        return "%s:%d" % (host.lower(), int(port))
+    except:
+        return ""
+
+def _encode(val):
+    """URL-encode a value with UTF-8 (defensive wrapper)."""
+    try:
+        return URLEncoder.encode(val, "UTF-8")
+    except:
+        # fallback to naive replace if encoding fails
+        return val.replace(" ", "%20")
+
+def _parse_location(location_header):
+    """
+    Parse Location header into a JavaNetURI if possible.
+    Returns (host, scheme) or (None, None) if parsing fails.
+    """
+    try:
+        # handle protocol-relative (//evil.example) by prefixing scheme
+        loc = location_header.strip()
+        if loc.startswith("//"):
+            loc = "http:" + loc  # safe normalization for parsing
+        juri = JavaNetURI(loc)
+        return (juri.getHost(), (juri.getScheme() or "").lower(), juri)
+    except Exception:
+        return (None, None, None)
+
+def _build_attack_uri(base_uri_obj, attack_query=None, attack_path_append=None):
+    """
+    Construct a raw attack URI string based on base URI components.
+    attack_query: full query string to set (no leading '?') or None
+    attack_path_append: string to append to path (e.g., '?payload' or '/payload')
+    """
+    try:
+        scheme = base_uri_obj.getScheme()
+        host = base_uri_obj.getHost()
+        port = base_uri_obj.getPort()
+        base_path = base_uri_obj.getPath() or "/"
+        # assemble path
+        new_path = base_path
+        if attack_path_append:
+            # If attack_path_append begins with '?' we treat it as query; else append to path
+            if attack_path_append.startswith("?"):
+                # keep path unchanged; query will be set below
+                pass
+            else:
+                # append path segment safely
+                if not new_path.endswith("/"):
+                    new_path = new_path + "/"
+                # strip leading slashes on append
+                new_path = new_path + attack_path_append.lstrip("/")
+        # assemble raw URI string
+        raw = scheme + "://" + host
+        if port != -1:
+            raw += ":" + str(port)
+        raw += new_path
+        # append query if provided
+        if attack_path_append and attack_path_append.startswith("?"):
+            raw += attack_path_append
+        elif attack_query:
+            if "?" in raw:
+                raw += "&" + attack_query
+            else:
+                raw += "?" + attack_query
+        return raw
+    except Exception as e:
+        _debug("URI build failed: %s" % e)
+        return None
+
+def _is_external_redirect(base_host_normalized, location_header):
+    """
+    Decide whether the Location header points to an external host.
+    Returns True if external (i.e., host differs and not empty), otherwise False.
+    """
+    try:
+        loc_host, loc_scheme, juri = _parse_location(location_header)
+        if not loc_host:
+            # Could be relative redirect (e.g., /foo) -> not external
+            return False
+        loc_norm = "%s:%d" % (loc_host.lower(), (juri.getPort() if juri.getPort() != -1 else (443 if loc_scheme == "https" else 80)))
+        return loc_norm != base_host_normalized
+    except Exception:
+        # Fallback: if location contains '//' followed by a non-base-host substring, treat as suspicious
+        try:
+            if "//" in location_header:
+                # naive substring check
+                if base_host_normalized.split(":")[0] not in location_header:
+                    return True
+        except:
+            pass
+        return False
+
+# ------------------------------------------------------------
+# Core logic: actively build attack requests and analyze responses
+# ------------------------------------------------------------
+def _should_continue_testing_for_host(host_key):
+    """Rate-limiting and max-tests enforcement per host."""
+    count = _tests_per_host.get(host_key, 0)
+    return count < MAX_TESTS_PER_HOST
+
+def _register_test_for_host(host_key):
+    _tests_per_host[host_key] = _tests_per_host.get(host_key, 0) + 1
+
+def _raise_alert(helper, attack_msg, evidence, param_name, payload):
+    """Raise a structured high-confidence alert with contextual evidence."""
+    try:
+        helper.newAlert() \
+            .setName("Open Redirect (Automated Generic Detector)") \
+            .setRisk(RISK_HIGH) \
+            .setConfidence(CONF_HIGH) \
+            .setDescription("The application appears to redirect to an external host when controlled input is provided. This indicates an open redirect vulnerability. Validate and whitelist redirect targets; avoid reflecting user input into Location headers.") \
+            .setParam(param_name or "") \
+            .setAttack(payload) \
+            .setEvidence(evidence) \
+            .setCweId(601) \
+            .setWascId(38) \
+            .setMessage(attack_msg) \
+            .raise()
+        _debug("ALERT: Open redirect detected; evidence=%s" % (evidence,))
+    except Exception as e:
+        _debug("Failed to raise alert: %s" % e)
+
+# ------------------------------------------------------------
+# Public entrypoint used by ZAP to run node-level active scans
+# ------------------------------------------------------------
+def scanNode(helper, msg):
+    """
+    Node-level active scan:
+      - Builds a set of generic attack vectors from payload templates and
+        common parameter names.
+      - For each constructed vector:
+        * clones the original request
+        * sets the attack URI
+        * sends request
+        * inspects Location header (and optionally follow-up)
+        * raises an alert when redirect target is external or contains payload
+    """
+    try:
+        uri = msg.getRequestHeader().getURI()
+        base_uri = uri  # often an org.apache.commons.httpclient.URI instance or similar
+        _debug("scanNode invoked for: %s" % (base_uri.toString(),))
+
+        # Normalize host:port for dedupe and external checks
+        try:
+            # use JavaNetURI for reliable host/port parsing
+            java_uri = JavaNetURI(base_uri.toString())
+            base_host_norm = _normalize_host_port(java_uri)
+        except:
+            base_host_norm = "%s:%s" % (base_uri.getHost().lower() if base_uri.getHost() else "", base_uri.getPort() if base_uri.getPort() != -1 else 80)
+
+        # Rate limiting guard
+        if not _should_continue_testing_for_host(base_host_norm):
+            _debug("Skipping tests for host (rate limit reached): %s" % base_host_norm)
+            return
+
+        # Prepare a canonical list of payload strings to try.
+        # Expand templates sensibly (e.g., insert actual host into templates that expect %s)
+        expanded_payloads = []
+        base_host_for_payload = base_uri.getHost() or "example.com"
+        for p in DEFAULT_PAYLOADS:
+            if "%s" in p:
+                expanded_payloads.append(p % base_host_for_payload)
+            else:
+                expanded_payloads.append(p)
+
+        # Additional variants: encoded and unencoded forms
+        payload_variants = []
+        for p in expanded_payloads:
+            payload_variants.append(p)
+            if ENCODE_PAYLOADS:
+                try:
+                    payload_variants.append(_encode(p))
+                except:
+                    payload_variants.append(p)
+
+        # Build a list of attack constructions:
+        #  - parameter injections: replace common redirect param names if present, else append new param
+        #  - path injections: append '?<payload>' or '/<payload>' to path (controlled by flag)
+        attack_vectors = []
+
+        # Inspect existing query string to consider parameter replacement
+        try:
+            orig_query = base_uri.getQuery() or ""
+        except:
+            orig_query = ""
+
+        # Param-based injections: if original query exists, create payloads replacing common param names
+        if TEST_PARAM_INJECTION:
+            # If the original URL contains named parameters, create replacements
+            if orig_query:
+                # naive parsing of query into key=value pairs (works for typical usage)
+                pairs = orig_query.split("&")
+                params = {}
+                for pair in pairs:
+                    if "=" in pair:
+                        k, v = pair.split("=", 1)
+                        params[k] = v
+                    else:
+                        params[pair] = ""
+
+                # For each common redirect param, create a variant that replaces it or appends it
+                for redirect_param in COMMON_REDIRECT_PARAMS:
+                    for payload in payload_variants:
+                        # Replace existing param if present
+                        if redirect_param in params:
+                            new_params = dict(params)
+                            new_params[redirect_param] = payload
+                            # reconstruct query
+                            q = "&".join(["%s=%s" % (k, v) for (k, v) in new_params.items()])
+                            attack_vectors.append(("param_replace", redirect_param, q))
+                        else:
+                            # append new param
+                            q = orig_query + "&%s=%s" % (redirect_param, payload) if orig_query else "%s=%s" % (redirect_param, payload)
+                            attack_vectors.append(("param_append", redirect_param, q))
+            else:
+                # No original query: add param-based payloads baseline
+                for redirect_param in COMMON_REDIRECT_PARAMS:
+                    for payload in payload_variants:
+                        q = "%s=%s" % (redirect_param, payload)
+                        attack_vectors.append(("param_append", redirect_param, q))
+
+        # Path-based injections
+        if TEST_PATH_INJECTION:
+            for payload in payload_variants:
+                # as query-style: ?<payload>  (we prefix with '?' to indicate a query append)
+                attack_vectors.append(("path_query", None, "?" + payload if not payload.startswith("?") else payload))
+                # as path-segment: /payload
+                attack_vectors.append(("path_segment", None, payload if payload.startswith("/") else "/" + payload))
+
+        _debug("Constructed %d attack vectors for %s" % (len(attack_vectors), base_host_norm))
+
+        # Execute attack vectors within rate limits
+        for vec_type, param_name, content in attack_vectors:
+            # enforce per-host test budget
+            if not _should_continue_testing_for_host(base_host_norm):
+                _debug("Host test budget exhausted during vector execution")
+                break
+
+            # Build attack URI string
+            attack_uri_str = _build_attack_uri(base_uri, attack_query=(content if vec_type.startswith("param") else None), attack_path_append=(content if vec_type.startswith("path") else None))
+            if not attack_uri_str:
+                continue
+
+            # Avoid re-testing identical (host,path,payload) combos
+            dedupe_key = (base_host_norm, base_uri.getPath() or "/", content)
+            if dedupe_key in _alerts_raised:
+                continue
+
+            # Construct request clone and set URI
+            try:
+                attack_msg = msg.cloneRequest()
+                # Use HttpClientURI for compatibility with ZAP request header setters
+                attack_uri = HttpClientURI(attack_uri_str, False)
+                attack_msg.getRequestHeader().setURI(attack_uri)
+            except Exception as e:
+                _debug("Failed to prepare attack message for URI: %s | error: %s" % (attack_uri_str, e))
+                _register_test_for_host(base_host_norm)
+                time.sleep(DELAY_BETWEEN_ATTACKS)
+                continue
+
+            # Send the attack - follow redirects = False (we want immediate Location header)
+            try:
+                helper.sendAndReceive(attack_msg, False, False)
+            except Exception as e:
+                _debug("Error sending attack request to %s : %s" % (attack_uri_str, e))
+                _register_test_for_host(base_host_norm)
+                time.sleep(DELAY_BETWEEN_ATTACKS)
+                continue
+
+            # Register that we executed a test for rate-limiting
+            _register_test_for_host(base_host_norm)
+
+            # Inspect Location header in response
+            try:
+                resp_loc = attack_msg.getResponseHeader().getHeader("Location")
+                # Also consider Refresh meta header or body-based JS redirect patterns (optional)
+            except Exception:
+                resp_loc = None
+
+            # Detection logic:
+            # 1) If Location points to an external host (parsed), it's a true open redirect.
+            # 2) Fallback: if Location contains the payload content (naive reflection),
+            #    it's suspicious and merits an alert.
+            is_open = False
+            evidence = None
+            if resp_loc:
+                # parse and compare
+                try:
+                    if _is_external_redirect(base_host_norm, resp_loc):
+                        is_open = True
+                        evidence = resp_loc
+                except Exception:
+                    pass
+
+                # fallback reflection check if not conclusively external
+                if not is_open:
+                    try:
+                        # check if content string (decoded variant) appears in Location
+                        check_content = content
+                        # if the content is encoded, decode for comparison as well
+                        try:
+                            decoded = URLDecoder.decode(content, "UTF-8")
+                            if decoded and decoded in resp_loc:
+                                is_open = True
+                                evidence = resp_loc
+                        except:
+                            pass
+                        if not is_open and content.strip("/") in resp_loc:
+                            is_open = True
+                            evidence = resp_loc
+                    except:
+                        pass
+
+            # If open redirect detected -> raise alert and record dedupe
+            if is_open:
+                # Use param_name to indicate where we injected; if None, indicate path injection
+                param_label = param_name if param_name else vec_type
+                _raise_alert(helper, attack_msg, evidence or resp_loc, param_label, content)
+                _alerts_raised.add(dedupe_key)
+
+            # Small delay to be polite
+            time.sleep(DELAY_BETWEEN_ATTACKS)
+
+    except Exception as e:
+        _debug("scanNode exception: %s" % e)
+
+
+# ------------------------------------------------------------
+# Optional scan() entrypoint stub for parameter-level active scanning
+# ZAP may call scan(helper,msg,param,value) when testing specific parameters;
+# Implementing this allows ZAP to invoke parameter-aware testing rather than node-level.
+# ------------------------------------------------------------
+def scan(helper, msg, param, value):
+    """
+    Param-level active scan entrypoint.
+    Behavior: if ZAP supplies a specific parameter name, attempt a targeted
+    replacement of that parameter with payloads and analyze Location header.
+    """
+    try:
+        if not param:
+            return
+
+        # Build a focused set of payloads (reuse DEFAULT_PAYLOADS expansion)
+        payloads = []
+        base_host = msg.getRequestHeader().getURI().getHost() or "example.com"
+        for p in DEFAULT_PAYLOADS:
+            payloads.append(p % base_host if "%s" in p else p)
+            if ENCODE_PAYLOADS:
+                try:
+                    payloads.append(_encode(p % base_host if "%s" in p else p))
+                except:
+                    payloads.append(p)
+
+        # For each payload, clone and replace the specified parameter's value
+        for payload in payloads:
+            try:
+                attack_msg = msg.cloneRequest()
+                uri = attack_msg.getRequestHeader().getURI()
+                # Rebuild query replacing the target param (naive approach)
+                orig_q = uri.getQuery() or ""
+                pairs = orig_q.split("&") if orig_q else []
+                new_pairs = []
+                replaced = False
+                for pair in pairs:
+                    if "=" in pair:
+                        k, v = pair.split("=", 1)
+                        if k == param:
+                            new_pairs.append("%s=%s" % (k, payload))
+                            replaced = True
+                        else:
+                            new_pairs.append(pair)
+                    else:
+                        new_pairs.append(pair)
+                if not replaced:
+                    new_pairs.append("%s=%s" % (param, payload))
+                new_q = "&".join(new_pairs)
+                # Build final attack URI string
+                attack_uri_str = uri.getScheme() + "://" + uri.getHost()
+                if uri.getPort() != -1:
+                    attack_uri_str += ":" + str(uri.getPort())
+                attack_uri_str += (uri.getPath() or "/") + "?" + new_q
+                attack_uri = HttpClientURI(attack_uri_str, False)
+                attack_msg.getRequestHeader().setURI(attack_uri)
+
+                helper.sendAndReceive(attack_msg, False, False)
+                resp_loc = attack_msg.getResponseHeader().getHeader("Location")
+                if resp_loc and _is_external_redirect(_normalize_host_port(JavaNetURI(uri.toString())), resp_loc):
+                    _raise_alert(helper, attack_msg, resp_loc, param, payload)
+            except Exception as e:
+                _debug("Param-scan error for %s=%s : %s" % (param, payload, e))
+
+    except Exception as e:
+        _debug("scan(param) exception: %s" % e)
