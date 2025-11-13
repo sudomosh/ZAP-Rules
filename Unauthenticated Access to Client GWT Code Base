@@ -1,45 +1,46 @@
 """
 Enterprise-Optimized GWT Passive Detector for OWASP ZAP (Jython 2.7)
 
-Purpose:
-- Passive-only detection of Google Web Toolkit (GWT) artifacts and DevMode flags
-  in HTTP responses handled by ZAP.
-- Expanded scan surface while preserving a low-noise operational profile:
-  - precompiled regexes for throughput
-  - content-type + extension heuristics
-  - header + body scanning
-  - safe decompression of gzip/deflate payloads
-  - evidence snippets, per-response deduplication
-  - lightweight telemetry counters for operational visibility
+This script provides a high-throughput, passive-only detection surface for
+Google Web Toolkit (GWT) artifacts, DevMode flags, and compiled bootstrap
+components within HTTP responses processed by ZAP.
 
-Usage:
-- Drop into ZAP Script Console as a Passive Scan Rule (Jython 2.7).
-- This script intentionally does NOT perform any active fetching; it only
-  analyzes responses ZAP already received.
+Key Operating Principles:
+- Zero-impact passive scanning (no outbound active requests).
+- Expanded coverage through combined header/body inspection.
+- Support for gzip/deflate decoding to access compressed JS payloads.
+- Precompiled regex engine for optimized scan throughput.
+- Evidence snippets to accelerate security analyst triage.
+- Optional telemetry for operational intelligence.
+
+Intended for enterprise environments where visibility into client-side
+framework exposure, debug-mode leakage, and compiled artifacts is critical.
 """
 
-# Python / Jython imports
+# --------------------------------------------------------------
+# Imports (Jython + Java wrappers used inside ZAP scripting model)
+# --------------------------------------------------------------
 import re
 from org.parosproxy.paros.network import HttpMessage
 from java.io import ByteArrayInputStream, InputStreamReader, BufferedReader
 from java.util.zip import GZIPInputStream, InflaterInputStream
 from java.nio.charset import Charset
 
-# -------------------------
-# Operational toggles
-# -------------------------
-DEBUG = True                        # Toggle console debug output
-MAX_BYTES = 2 * 1024 * 1024         # 2 MB cap for scanned payloads (safeguard)
-SNIPPET_RADIUS = 120                # evidence snippet radius (chars)
+# --------------------------------------------------------------
+# Operational Controls & Tuning Flags
+# --------------------------------------------------------------
+DEBUG = True                      # Enable or disable console debug logs
+MAX_BYTES = 2 * 1024 * 1024       # Hard cap on scanable body size (2 MB)
+SNIPPET_RADIUS = 120              # Context length for evidence snippets
 
-# Risk / Confidence (ZAP conventions)
+# Risk & Confidence Constants (ZAP standard scale)
 RISK_INFO, RISK_LOW, RISK_MED, RISK_HIGH = 0, 1, 2, 3
 CONF_LOW, CONF_MED, CONF_HIGH = 1, 2, 3
 
-# -------------------------
-# Scan surface controls
-# -------------------------
-# Content-Types and extensions to include in passive scan surface
+# --------------------------------------------------------------
+# Scan Surface Definition (Content-Types & Extensions)
+# These heuristics determine whether the response should be scanned.
+# --------------------------------------------------------------
 SCAN_CONTENT_TYPES = (
     "text/html",
     "text/javascript",
@@ -48,127 +49,160 @@ SCAN_CONTENT_TYPES = (
     "application/json",
     "text/plain",
 )
+
 SCAN_EXTENSIONS = (".html", ".htm", ".js", ".map", ".json")
 
-# -------------------------
-# Detection patterns (module-load compilation for throughput)
-# -------------------------
-# Each entry: (regex, name, description, risk, confidence)
+# --------------------------------------------------------------
+# GWT Detection Patterns (Compiled at Load-Time)
+# Pattern: (regex, alert-name, description, risk, confidence)
+# --------------------------------------------------------------
 _RAW_PATTERNS = [
-    (r'(?:^|[^A-Za-z0-9_])gwt\.codesvr\s*=', "GWT DevMode Parameter Detected (gwt.codesvr) - (CUSTOM)",
-     "Indicates GWT DevMode/CodeServer enabled. Should not appear in production.", RISK_MED, CONF_MED),
+    (r'(?:^|[^A-Za-z0-9_])gwt\.codesvr\s*=', 
+     "GWT DevMode Parameter Detected (gwt.codesvr) - (CUSTOM)",
+     "Indicates GWT DevMode/CodeServer enabled. This should never be exposed in production.",
+     RISK_MED, CONF_MED),
 
-    (r'__gwt_codeServerPort', "GWT DevMode CodeServer Port Variable (CUSTOM)",
-     "Found '__gwt_codeServerPort', used for GWT DevMode debugging.", RISK_MED, CONF_MED),
+    (r'__gwt_codeServerPort',
+     "GWT DevMode CodeServer Port Variable (CUSTOM)",
+     "Presence of __gwt_codeServerPort implies live debug-mode capabilities.",
+     RISK_MED, CONF_MED),
 
-    (r'\.nocache\.js\b', "GWT Bootstrap Script (.nocache.js) - (CUSTOM)",
-     "GWT bootstrap script detected. Confirms GWT client usage.", RISK_LOW, CONF_MED),
+    (r'\.nocache\.js\b',
+     "GWT Bootstrap Script (.nocache.js) - (CUSTOM)",
+     "Presence of a GWT bootstrap loader file confirms GWT client usage.",
+     RISK_LOW, CONF_MED),
 
-    (r'\.cache\.(?:js|html)\b', "GWT Compiled Artifact (.cache.js/.cache.html) - (CUSTOM)",
-     "GWT compiled permutation artifact detected. Confirms GWT client usage.", RISK_LOW, CONF_MED),
+    (r'\.cache\.(?:js|html)\b',
+     "GWT Compiled Artifact (.cache.js/.cache.html) - (CUSTOM)",
+     "Compiled GWT permutation artifacts detected in response.",
+     RISK_LOW, CONF_MED),
 
-    (r'\b(?:__gwt_onLoad|gwtOnLoad)\b', "GWT Bootstrap Function Detected (CUSTOM)",
-     "GWT bootstrap onLoad function found.", RISK_INFO, CONF_MED),
+    (r'\b(?:__gwt_onLoad|gwtOnLoad)\b',
+     "GWT Bootstrap Function Detected (CUSTOM)",
+     "GWT onLoad bootstrap handler present in response.",
+     RISK_INFO, CONF_MED),
 
-    (r'\b__gwt_jsonp__\b', "GWT JSONP Callback Detected (CUSTOM)",
-     "GWT JSONP callback '__gwt_jsonp__' found.", RISK_INFO, CONF_MED),
+    (r'\b__gwt_jsonp__\b',
+     "GWT JSONP Callback Detected (CUSTOM)",
+     "GWT JSONP callback '__gwt_jsonp__' seen in client-side output.",
+     RISK_INFO, CONF_MED),
 
-    (r'\bcom\.google\.gwt\b', "GWT Namespace Reference (CUSTOM)",
-     "Reference to 'com.google.gwt' found, suggesting GWT client code.", RISK_INFO, CONF_MED),
+    (r'\bcom\.google\.gwt\b',
+     "GWT Namespace Reference (CUSTOM)",
+     "Client references Google Web Toolkit namespace.",
+     RISK_INFO, CONF_MED),
 ]
 
-# Precompile regexes for performance (re.IGNORECASE)
-COMPILED_PATTERNS = [(re.compile(p, re.IGNORECASE), name, desc, risk, conf) for (p, name, desc, risk, conf) in _RAW_PATTERNS]
+# Precompile regex rules for high-throughput scanning
+COMPILED_PATTERNS = [
+    (re.compile(p, re.IGNORECASE), name, desc, risk, conf)
+    for (p, name, desc, risk, conf) in _RAW_PATTERNS
+]
 
-# Lightweight regexes to extract script/link/src and sourceMappingURL
+# Supplemental discovery regexes for script, link, and sourcemap references
 _SCRIPT_SRC_RE = re.compile(r'<script[^>]+src=[\'"]([^\'"]+)[\'"]', re.IGNORECASE)
 _LINK_SRC_RE = re.compile(r'<link[^>]+href=[\'"]([^\'"]+)[\'"]', re.IGNORECASE)
 _SOURCEMAP_RE = re.compile(r'sourceMappingURL\s*=\s*([^\s;]+)', re.IGNORECASE)
 
-# -------------------------
-# Telemetry counters (in-memory, per-script-run)
-# -------------------------
+# --------------------------------------------------------------
+# Telemetry counters (in-memory only)
+# Useful for debugging or performance monitoring
+# --------------------------------------------------------------
 _scanned_responses = 0
 _matches_found = 0
 
-# -------------------------
-# Helper utilities
-# -------------------------
+# --------------------------------------------------------------
+# Debug Logging Wrapper
+# Ensures operational logs don't break scanning flow
+# --------------------------------------------------------------
 def _debug(msg):
-    """Controlled debug output for operational observability."""
     if DEBUG:
         try:
             print("[GWT-Detector] %s" % msg)
         except:
-            # Best-effort logging: never raise from logger
             pass
 
+
+# --------------------------------------------------------------
+# Safe Compressed Response Decoder
+# Supports gzip/deflate payloads often used for JS resources
+# --------------------------------------------------------------
 def _safe_decode_body(msg):
     """
-    Return the response body as a (unicode) string.
-    - Handles gzip/deflate encoded payloads where Content-Encoding is set.
-    - Falls back to msg.getResponseBody().toString() on failure.
+    Returns the decoded response body, including handling gzip and deflate
+    encodings. Falls back gracefully if decoding is not possible.
     """
     try:
         hdr = msg.getResponseHeader()
         enc = (hdr.getHeader("Content-Encoding") or "").lower()
-        # If no encoding, prefer toString (ZAP usually provides decoded text)
+
+        # Fast path: no encoding → ZAP handles the decode
         if not enc:
             return msg.getResponseBody().toString()
 
-        # Get raw bytes and wrap in Java ByteArrayInputStream
+        # Extract raw bytes and wrap in Java input stream
         body_bytes = msg.getResponseBody().getBytes()
         bais = ByteArrayInputStream(body_bytes)
 
         if "gzip" in enc:
-            instream = GZIPInputStream(bais)
+            stream = GZIPInputStream(bais)
         elif "deflate" in enc or "zlib" in enc:
-            instream = InflaterInputStream(bais)
+            stream = InflaterInputStream(bais)
         else:
-            # Unknown encoding - fall back
             return msg.getResponseBody().toString()
 
-        # Read via BufferedReader with UTF-8 charset; safe fallback to replace errors
-        reader = BufferedReader(InputStreamReader(instream, Charset.forName("UTF-8")))
+        # Buffered UTF-8 decode
+        reader = BufferedReader(InputStreamReader(stream, Charset.forName("UTF-8")))
         lines = []
         line = reader.readLine()
         while line is not None:
             lines.append(line)
             line = reader.readLine()
         return u"\n".join(lines)
-    except Exception as e:
-        _debug("decompression/decoding failed: %s" % e)
-        try:
-            return msg.getResponseBody().toString()
-        except:
-            return u""
 
+    except Exception as e:
+        _debug("Decode failed: %s" % e)
+        return msg.getResponseBody().toString()
+
+
+# --------------------------------------------------------------
+# Heuristic: Should this response be scanned?
+# Driven by MIME-type and file extension detection.
+# --------------------------------------------------------------
 def _should_scan_uri(uri, ctype):
-    """Heuristic to decide whether to scan a response (content-type OR extension match)."""
-    uri = (uri or "").lower()
-    ctype = (ctype or "").lower()
+    uri = uri.lower()
+    ctype = ctype.lower()
+
     if any(ct in ctype for ct in SCAN_CONTENT_TYPES):
         return True
+
     for ext in SCAN_EXTENSIONS:
         if uri.endswith(ext):
             return True
+
     return False
 
+
+# --------------------------------------------------------------
+# Evidence Snippet Generator
+# Provides context around matched patterns to assist triage
+# --------------------------------------------------------------
 def _first_snippet(text, offset, radius=SNIPPET_RADIUS):
-    """Return a normalized, bounded evidence snippet around offset."""
     try:
         start = max(0, offset - radius)
         end = min(len(text), offset + radius)
         snippet = text[start:end]
-        snippet = snippet.replace("\r", " ").replace("\n", " ")
-        snippet = re.sub(r'\s+', ' ', snippet).strip()
+        snippet = snippet.replace("\n", " ").replace("\r", " ")
+        snippet = re.sub(r"\s+", " ", snippet).strip()
         return u"...%s..." % snippet
     except:
-        return u""
+        return u"..."
 
+
+# --------------------------------------------------------------
+# Extract script/link/src and source map references (telemetry only)
+# --------------------------------------------------------------
 def _extract_script_refs(html_text):
-    """Passive extraction of local/remote script and link references and source maps.
-       Note: this is discovery only; we DO NOT fetch external resources in passive mode."""
     refs = []
     try:
         for m in _SCRIPT_SRC_RE.finditer(html_text):
@@ -177,12 +211,16 @@ def _extract_script_refs(html_text):
             refs.append(m.group(1))
         for m in _SOURCEMAP_RE.finditer(html_text):
             refs.append(m.group(1))
-    except Exception:
+    except:
         pass
     return refs
 
+
+# --------------------------------------------------------------
+# Alert Builder Wrapper
+# Ensures consistent, structured alert generation
+# --------------------------------------------------------------
 def _raise_alert(pscan, msg, name, desc, evidence, risk, confidence):
-    """Encapsulated alert builder to keep alert creation consistent and transactional."""
     global _matches_found
     try:
         alert = pscan.newAlert()
@@ -192,101 +230,90 @@ def _raise_alert(pscan, msg, name, desc, evidence, risk, confidence):
              .setDescription(desc) \
              .setEvidence(evidence) \
              .setParam(msg.getRequestHeader().getURI().toString()) \
-             .setSolution("Remove DevMode flags, avoid exposing debug builds, and ensure no secrets in bundles.") \
+             .setSolution("Remove DevMode exposure, avoid debug builds, and validate production bundles.") \
              .setReference("https://www.gwtproject.org/") \
              .setCweId(200) \
              .setWascId(13) \
              .setMessage(msg) \
              .raise()
         _matches_found += 1
-        _debug("Raised alert: %s | evidence=%s" % (name, evidence))
+        _debug("Alert raised: %s" % name)
     except Exception as e:
-        _debug("Exception while raising alert: %s" % e)
+        _debug("Alert generation error: %s" % e)
 
-# -------------------------
-# Script entrypoints for ZAP Passive Scan Rule
-# -------------------------
+
+# --------------------------------------------------------------
+# Core Passive Scan Entry Point (invoked for each HTTP response)
+# --------------------------------------------------------------
 def scan(pscan, msg, src):
     """
-    Passive-scan handler (ZAP invokes this for each response).
+    ZAP triggers this function for every received HTTP response.
 
-    Strategy:
-    - Scope by content-type / extension to reduce unnecessary processing
-    - Decode compressed payloads safely
-    - Scan headers and body with precompiled regexes
-    - Extract script/.map references for discovery (no fetching)
-    - Deduplicate alerts per response by (alert-name)
+    Workflow:
+    1. Filter responses by Content-Type/Extension.
+    2. Decode compressed responses (gzip/deflate).
+    3. Scan aggregated headers and body using precompiled regexes.
+    4. Generate alerts for matched patterns (deduplicated per response).
+    5. Log and track telemetry for operations and debugging.
     """
     global _scanned_responses
+
     try:
         uri = msg.getRequestHeader().getURI().toString()
-        uri_l = (uri or "").lower()
-        ctype = (msg.getResponseHeader().getHeader("Content-Type") or "").lower()
+        ctype = msg.getResponseHeader().getHeader("Content-Type") or ""
 
-        # Decide whether to scan this response
-        if not _should_scan_uri(uri_l, ctype):
-            _debug("Skipping non-target response: %s | ctype=%s" % (uri, ctype))
+        # Step 1: Evaluate scanning eligibility
+        if not _should_scan_uri(uri, ctype):
+            _debug("Skipping non-target response: %s" % uri)
             return
 
         _scanned_responses += 1
         _debug("Scanning response: %s" % uri)
 
-        # Decode body (handles compressed payloads where applicable)
+        # Step 2: Decode payload
         body = _safe_decode_body(msg) or u""
-        if not body:
-            _debug("Empty body after decode: %s" % uri)
-            return
-
-        # Truncate very large bodies to preserve CPU while still catching indicators
         if len(body) > MAX_BYTES:
-            _debug("Body > MAX_BYTES, truncating for scan: %d -> %d" % (len(body), MAX_BYTES))
             body = body[:MAX_BYTES]
+            _debug("Response truncated due to MAX_BYTES limit.")
 
-        # Aggregate small headers section as it's cheap to scan and often contains useful hints
+        # Step 3: Combine body + headers into scan surface
         headers_text = msg.getResponseHeader().toString() or u""
         scan_surface = headers_text + u"\n" + body
 
-        # Keep track of which alert names we've already raised for this response
-        raised_for_response = set()
+        raised_for_response = set()  # avoid duplicate alerts for same indicator
 
-        # Primary detection: precompiled token patterns
+        # Step 4: Pattern matching against precompiled rules
         for (cre, name, desc, risk, conf) in COMPILED_PATTERNS:
             for m in cre.finditer(scan_surface):
-                if name in raised_for_response:
-                    continue
-                ev = _first_snippet(scan_surface, m.start())
-                _raise_alert(pscan, msg, name, desc, ev, risk, conf)
-                raised_for_response.add(name)
+                if name not in raised_for_response:
+                    snippet = _first_snippet(scan_surface, m.start())
+                    _raise_alert(pscan, msg, name, desc, snippet, risk, conf)
+                    raised_for_response.add(name)
 
-        # Supplemental: extract script / source map references for discovery telemetry
-        try:
-            refs = _extract_script_refs(body)
-            if refs:
-                _debug("Discovered %d script/link/src refs for %s" % (len(refs), uri))
-                # Optionally attach a discovery alert or telemetry; to avoid noise we just log
-                # If you want, uncomment below to raise a low-risk informational alert with refs:
-                # _raise_alert(pscan, msg, "GWT External Resource References (CUSTOM)", "Script/link/sourceMap references discovered in HTML.", ", ".join(refs[:5]), RISK_INFO, CONF_LOW)
-        except Exception as e:
-            _debug("Error extracting script refs: %s" % e)
-
-        _debug("Scan complete for: %s" % uri)
+        # Step 5: Supplementary script reference extraction (telemetry only)
+        refs = _extract_script_refs(body)
+        if refs:
+            _debug("Script/Map references discovered: %d" % len(refs))
 
     except Exception as e:
         _debug("Passive scan exception: %s" % e)
 
+
+# --------------------------------------------------------------
+# Node-level wrapper (for compatibility with ZAP passive scanner)
+# --------------------------------------------------------------
 def scanNode(pscan, msg):
-    """
-    Node-level adapter for parity with other rules. Delegates to scan().
-    Kept to preserve the original skeleton and compatibility.
-    """
     scan(pscan, msg, None)
 
-# -------------------------
-# Optional: administrative function to surface telemetry on-demand
-# You can call show_telemetry() from the script console for an operational snapshot.
-# -------------------------
+
+# --------------------------------------------------------------
+# Optional Telemetry Inspection Function
+# Call this from ZAP console to see counters:
+# >>> show_telemetry()
+# --------------------------------------------------------------
 def show_telemetry():
     try:
-        print("[GWT-Detector] Telemetry: scanned_responses=%d, matches_found=%d" % (_scanned_responses, _matches_found))
+        print("[Telemetry] scanned_responses=%d | matches_found=%d"
+              % (_scanned_responses, _matches_found))
     except:
         pass
