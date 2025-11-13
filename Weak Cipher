@@ -1,0 +1,186 @@
+"""
+Optimized: Custom Weak Algorithm Detection (Jython) Active Scan Rule for ZAP.
+
+Preserves the original skeleton: getMetadata(), scan(), scanNode().
+Extended to support multiple weak algorithms and optimized for performance.
+"""
+
+import re
+from org.parosproxy.paros.network import HttpMessage
+from org.zaproxy.addon.commonlib.scanrules import ScanRuleMetadata
+
+# ------------------------------------------------------------------
+# Policy / Engine config - update this mapping to add/remove algorithms
+# key = normalized algorithm token
+# values: friendly name, cwe, wasc, suggested risk (1=low,2=medium,3=high)
+# ------------------------------------------------------------------
+WEAK_ALGORITHMS = {
+    "sha1": {"name": "SHA-1", "cwe": 327, "wasc": 0, "risk": 2},
+    "md5":  {"name": "MD5",   "cwe": 327, "wasc": 0, "risk": 2},
+    "des":  {"name": "DES",   "cwe": 327, "wasc": 0, "risk": 3},
+    "3des": {"name": "3DES",  "cwe": 327, "wasc": 0, "risk": 3},
+    "rc4":  {"name": "RC4",   "cwe": 327, "wasc": 0, "risk": 2}
+}
+
+# Build an efficient, single regex to catch algorithm names and common variants.
+# Use word boundaries and allow hyphen variants like "sha-1"
+ALGO_PATTERN = r'\b(?:' + r'|'.join([
+    r'sha[-\s]?1',
+    r'sha1',
+    r'md5',
+    r'3des',
+    r'triple[-\s]?des',
+    r'des\b',
+    r'rc4'
+]) + r')\b'
+# Also detect raw hex digests of length 32 (MD5) or 40 (SHA1) as supplemental evidence
+HEX_DIGEST_PATTERN = r'\b([a-f0-9]{32}|[a-f0-9]{40})\b'
+
+_COMPILED_ALGO_RE = re.compile(ALGO_PATTERN, re.IGNORECASE)
+_COMPILED_HEX_RE = re.compile(HEX_DIGEST_PATTERN, re.IGNORECASE)
+
+# Cap how much of the response we scan for performance (tunable)
+MAX_SCAN_BYTES = 200 * 1024  # 200 KB
+
+def getMetadata():
+    return ScanRuleMetadata.fromYaml("""
+id: 4000304
+name: Weak Algorithm Detection - Custom Jython Active Rule
+description: Detects usage of weak cryptographic algorithms (SHA-1, MD5, DES, 3DES, RC4) in HTTP responses.
+solution: Replace weak algorithms (e.g., SHA-1, MD5, DES) with stronger alternatives such as SHA-256 or SHA-3; deprecate insecure ciphers and protocols.
+references:
+  - https://cwe.mitre.org/data/definitions/327.html
+  - https://owasp.org/www-community/Weak_Cryptography
+category: MISC
+risk: MEDIUM
+confidence: HIGH
+cweId: 327
+wascId: 101
+alertTags:
+  OWASP_2021_A02: Cryptographic Failures
+  OWASP_2017_A03: Sensitive Data Exposure
+otherInfo: Custom script-based detection of weak cipher names and digest patterns in headers or body. Scan is limited to a configurable size to avoid large responses.
+status: alpha
+""")
+
+def _normalize_token(token):
+    """Normalize match into a canonical key present in WEAK_ALGORITHMS."""
+    t = token.lower().replace('-', '').replace(' ', '')
+    # map common variants
+    if t.startswith('sha1'):
+        return 'sha1'
+    if t == 'md5':
+        return 'md5'
+    if t in ('3des', 'tripledes', 'tripledes'):
+        return '3des'
+    if t == 'des':
+        return 'des'
+    if t == 'rc4':
+        return 'rc4'
+    return t
+
+def _extract_context(text, start, end, radius=40):
+    s = max(0, start - radius)
+    e = min(len(text), end + radius)
+    snippet = text[s:e]
+    # normalize whitespace for display
+    return '...{}...'.format(re.sub(r'\s+', ' ', snippet).strip())
+
+def scan(helper, msg, param, value):
+    try:
+        uri = msg.getRequestHeader().getURI().toString()
+        print("[DEBUG] Active scan triggered for:", uri)
+
+        # Ensure response is populated
+        helper.sendAndReceive(msg, False, True)
+
+        # Fetch response pieces and respect scan-size cap for large responses
+        headers = msg.getResponseHeader().toString() or ""
+        body = msg.getResponseBody().toString() or ""
+
+        combined = headers + "\n" + body
+        if len(combined) > MAX_SCAN_BYTES:
+            combined = combined[:MAX_SCAN_BYTES]
+            print("[DEBUG] Response truncated to {} bytes for scanning.".format(MAX_SCAN_BYTES))
+
+        print("[DEBUG] Scanning combined length:", len(combined))
+
+        # Track algorithms already alerted for this response to avoid duplicate alerts
+        alerted_algos = set()
+
+        # Primary: search for algorithm name tokens
+        for m in _COMPILED_ALGO_RE.finditer(combined):
+            token = m.group(0)
+            key = _normalize_token(token)
+            if key not in WEAK_ALGORITHMS:
+                # Unknown token (defensive), skip
+                continue
+            if key in alerted_algos:
+                continue
+
+            algo_meta = WEAK_ALGORITHMS[key]
+            evidence = _extract_context(combined, m.start(), m.end())
+
+            (helper.newAlert()
+                .setName("Weak Algorithm Detected: {}".format(algo_meta["name"]))
+                .setRisk(algo_meta.get("risk", 2))
+                .setConfidence(3)
+                .setDescription("The application response contains evidence of a weak cryptographic algorithm: {}.".format(algo_meta["name"]))
+                .setParam(param or "")
+                .setAttack("Detected weak algorithm token in response")
+                .setEvidence(evidence)
+                .setCweId(algo_meta.get("cwe", 327))
+                .setWascId(algo_meta.get("wasc", 101))
+                .setMessage(msg)
+                .raise())
+            print("[DEBUG] ALERT RAISED: {} detected -> {}".format(algo_meta["name"], token))
+            alerted_algos.add(key)
+
+        # Secondary: detect raw hex digests (possible MD5/SHA1 hashes) as supporting evidence.
+        # Only raise if we didn't already raise for the corresponding algorithm to reduce noise.
+        for hm in _COMPILED_HEX_RE.finditer(combined):
+            hexval = hm.group(1)
+            hexlen = len(hexval)
+            if hexlen == 40 and 'sha1' not in alerted_algos:
+                # SHA-1 hex digest candidate
+                evidence = _extract_context(combined, hm.start(), hm.end())
+                algo_meta = WEAK_ALGORITHMS.get('sha1', {})
+                (helper.newAlert()
+                    .setName("Possible SHA-1 Digest Found")
+                    .setRisk(algo_meta.get("risk", 2))
+                    .setConfidence(2)
+                    .setDescription("A 40-character hex string was found in the response and may represent a SHA-1 digest.")
+                    .setEvidence(evidence)
+                    .setParam(param or "")
+                    .setMessage(msg)
+                    .setCweId(algo_meta.get("cwe", 327))
+                    .raise())
+                print("[DEBUG] ALERT RAISED: possible SHA1 hex ->", hexval)
+                alerted_algos.add('sha1')
+                break  # avoid many alerts for hex blobs
+
+            if hexlen == 32 and 'md5' not in alerted_algos:
+                # MD5 hex digest candidate
+                evidence = _extract_context(combined, hm.start(), hm.end())
+                algo_meta = WEAK_ALGORITHMS.get('md5', {})
+                (helper.newAlert()
+                    .setName("Possible MD5 Digest Found")
+                    .setRisk(algo_meta.get("risk", 2))
+                    .setConfidence(2)
+                    .setDescription("A 32-character hex string was found in the response and may represent an MD5 digest.")
+                    .setEvidence(evidence)
+                    .setParam(param or "")
+                    .setMessage(msg)
+                    .setCweId(algo_meta.get("cwe", 327))
+                    .raise())
+                print("[DEBUG] ALERT RAISED: possible MD5 hex ->", hexval)
+                alerted_algos.add('md5')
+                break
+
+    except Exception as e:
+        # Keep debugging output lightweight for operations teams
+        print("[ERROR] Exception in Active Scan rule:", str(e))
+
+def scanNode(helper, msg):
+    # Preserve node-level invocation semantics by delegating to scan()
+    scan(helper, msg, None, None)
