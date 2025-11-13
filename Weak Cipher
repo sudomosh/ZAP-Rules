@@ -1,13 +1,15 @@
 """
-Optimized: Custom Weak Algorithm Detection (Jython) Active Scan Rule for ZAP.
+Enterprise-Optimized Weak Cryptography Detection Rule for OWASP ZAP (Jython)
 
-Preserves the original skeleton: getMetadata(), scan(), scanNode().
-Extended to support multiple weak algorithms and optimized for performance.
+This script operationalizes a high-efficiency active scanning workflow designed
+to identify weak or deprecated cryptographic primitives embedded in HTTP 
+response data. The rule is architected to detect explicit algorithm tokens 
+(SHA-1, MD5, DES, 3DES, RC4) as well as heuristic indicators such as raw 
+hexadecimal digests that typically represent insecure hashing outputs.
 """
 
 import re
 from org.parosproxy.paros.network import HttpMessage
-from org.zaproxy.addon.commonlib.scanrules import ScanRuleMetadata
 
 # ------------------------------------------------------------------
 # Policy / Engine config - update this mapping to add/remove algorithms
@@ -43,7 +45,7 @@ _COMPILED_HEX_RE = re.compile(HEX_DIGEST_PATTERN, re.IGNORECASE)
 MAX_SCAN_BYTES = 200 * 1024  # 200 KB
 
 def getMetadata():
-    return ScanRuleMetadata.fromYaml("""
+    return ("""
 id: 4000304
 name: Weak Algorithm Detection - Custom Jython Active Rule
 description: Detects usage of weak cryptographic algorithms (SHA-1, MD5, DES, 3DES, RC4) in HTTP responses.
